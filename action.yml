@@ -1,0 +1,132 @@
+name: 'AgentMinds Scan'
+description: 'Run an AgentMinds site scan in CI. Posts a PR comment with grade, issues, and a link to the full report. No signup required.'
+author: 'AgentMinds'
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  url:
+    description: 'URL to scan (typically your preview deployment, e.g. ${{ env.PREVIEW_URL }})'
+    required: true
+  fail-on-grade:
+    description: 'Fail the workflow if the scan returns this grade or worse (A, B, C, D, F). Default: F (only fail on outright failure).'
+    required: false
+    default: 'F'
+  github-token:
+    description: 'GITHUB_TOKEN for posting PR comments. Defaults to ${{ github.token }}.'
+    required: false
+    default: ${{ github.token }}
+  comment:
+    description: 'Post a PR comment with results. Default: true. Set to false for fail-only mode.'
+    required: false
+    default: 'true'
+
+outputs:
+  grade:
+    description: 'Overall grade returned by AgentMinds (A/B/C/D/F)'
+    value: ${{ steps.scan.outputs.grade }}
+  score:
+    description: 'Overall score 0-100'
+    value: ${{ steps.scan.outputs.score }}
+  scan-url:
+    description: 'Shareable URL to the full scan report'
+    value: ${{ steps.scan.outputs.scan-url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Run AgentMinds scan
+      id: scan
+      shell: bash
+      env:
+        AGENTMINDS_URL: ${{ inputs.url }}
+        AGENTMINDS_FAIL_ON: ${{ inputs.fail-on-grade }}
+      run: |
+        set -e
+        echo "Scanning $AGENTMINDS_URL..."
+
+        RESPONSE=$(curl -sS --max-time 60 \
+          -X POST https://api.agentminds.dev/api/v1/free-scan \
+          -H "Content-Type: application/json" \
+          -d "{\"url\":\"$AGENTMINDS_URL\"}")
+
+        echo "$RESPONSE" > /tmp/agentminds-result.json
+
+        GRADE=$(echo "$RESPONSE" | jq -r '.grade // "?"')
+        SCORE=$(echo "$RESPONSE" | jq -r '.overall_score // 0')
+        PUBLIC_ID=$(echo "$RESPONSE" | jq -r '.public_id // ""')
+        SHARE_URL=$(echo "$RESPONSE" | jq -r '.share_url // ""')
+
+        echo "grade=$GRADE" >> "$GITHUB_OUTPUT"
+        echo "score=$SCORE" >> "$GITHUB_OUTPUT"
+        echo "scan-url=$SHARE_URL" >> "$GITHUB_OUTPUT"
+
+        # Order grades worst → best
+        rank() {
+          case "$1" in
+            F) echo 0 ;; D) echo 1 ;; C) echo 2 ;; B) echo 3 ;; A) echo 4 ;; *) echo 5 ;;
+          esac
+        }
+        SCAN_RANK=$(rank "$GRADE")
+        FAIL_RANK=$(rank "$AGENTMINDS_FAIL_ON")
+
+        echo ""
+        echo "::group::AgentMinds scan result"
+        echo "URL:   $AGENTMINDS_URL"
+        echo "Grade: $GRADE (score $SCORE/100)"
+        echo "Report: $SHARE_URL"
+        echo "::endgroup::"
+
+        if [ "$SCAN_RANK" -le "$FAIL_RANK" ]; then
+          echo "::error::Scan grade $GRADE is at or below fail threshold $AGENTMINDS_FAIL_ON"
+          exit 1
+        fi
+
+    - name: Comment on PR
+      if: ${{ github.event_name == 'pull_request' && inputs.comment == 'true' }}
+      uses: actions/github-script@v7
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const fs = require('fs');
+          const data = JSON.parse(fs.readFileSync('/tmp/agentminds-result.json', 'utf8'));
+          const grade = (data.grade || '?').toUpperCase();
+          const score = data.overall_score ?? 0;
+          const sec = data.security?.score ?? 0;
+          const seo = data.seo?.score ?? 0;
+          const rt = data.performance?.metrics?.response_time_ms ?? 'n/a';
+          const shareUrl = data.share_url || '';
+          const badgeUrl = data.badge_url || '';
+
+          const issues = [];
+          (data.security?.issues || []).slice(0, 3).forEach((i) => issues.push(`- 🛡 **${i.severity}** ${i.message}`));
+          (data.seo?.issues || []).slice(0, 3).forEach((i) => issues.push(`- 🔍 **${i.severity}** ${i.message}`));
+          const issueBlock = issues.length ? issues.join('\n') : '_No critical issues._';
+
+          const body = [
+            `## ${badgeUrl ? `![AgentMinds Grade](${badgeUrl}) ` : ''}AgentMinds scan: \`${data.url}\``,
+            ``,
+            `| Grade | Overall | Security | SEO/AEO | Latency |`,
+            `|---|---|---|---|---|`,
+            `| **${grade}** | ${score}/100 | ${sec}/100 | ${seo}/100 | ${rt}ms |`,
+            ``,
+            `### Top issues`,
+            issueBlock,
+            ``,
+            shareUrl ? `[Full report →](${shareUrl})` : '',
+          ].filter(Boolean).join('\n');
+
+          // Find existing comment by this action and update, else create new.
+          const marker = '<!-- agentminds-scan-comment -->';
+          const finalBody = body + '\n\n' + marker;
+          const { owner, repo } = context.repo;
+          const issue_number = context.payload.pull_request.number;
+
+          const { data: existing } = await github.rest.issues.listComments({ owner, repo, issue_number, per_page: 100 });
+          const ours = existing.find((c) => (c.body || '').includes(marker));
+          if (ours) {
+            await github.rest.issues.updateComment({ owner, repo, comment_id: ours.id, body: finalBody });
+          } else {
+            await github.rest.issues.createComment({ owner, repo, issue_number, body: finalBody });
+          }
